@@ -1,4 +1,4 @@
-
+﻿
 
 // ============================================================================
 //  main.cpp —— 基于 wxWidgets 的电路编辑器
@@ -27,6 +27,7 @@
 #include <map>
 #include <set>
 #include <utility>
+#include <wx/tokenzr.h>
 
 
 static void DrawBezierPath(wxDC& dc,
@@ -73,6 +74,14 @@ public:
 
     virtual void ReadInputs(const std::map<std::pair<int, int>, int>& /*netValues*/) {}
     virtual void WriteOutputs(std::map<std::pair<int, int>, int>& /*netValues*/) const {}
+    virtual wxString Serialize() const {
+        return wxString::Format("%s\t%d\t%d", GetType(), pos.x, pos.y);
+    }
+    virtual bool Deserialize(const wxArrayString& fields) {
+        if (fields.size() < 3) return false;
+        pos = wxPoint(wxAtoi(fields[1]), wxAtoi(fields[2]));
+        return true;
+    }
 };
 
 
@@ -649,6 +658,8 @@ struct Wire
     int        startPin = -1;
     wxPoint    startFree;
     wxPoint    end;
+    Component* endComp = nullptr;
+    int        endPin = -1;
     bool       selected = false;
     int        value = 0;
 
@@ -800,7 +811,7 @@ static wxString NetlistPartToken(const wxString& type)
             (value >= '0' && value <= '9'))
             token += ch;
         else if (value == ' ' || value == '-' || value == '_' ||
-                 value == '/' || value == '.')
+            value == '/' || value == '.')
             token += wxT('_');
     }
 
@@ -1203,6 +1214,121 @@ public:
 
     void SetMode(Mode m) { m_mode = m; }
 
+    // ---- 新增功能 1：清空画布 (New) ----
+    void ClearAll()
+    {
+        m_components.clear();
+        m_wires.clear();
+        m_draggingIndex = -1;
+        m_drawingWire = false;
+        m_wireSrcComp = nullptr;
+        m_wireSrcPin = -1;
+        m_boxSelecting = false;
+        Refresh();
+    }
+
+    // ---- 新增功能 2：保存到文件 (Save) ----
+    bool SaveToFile(const wxString& path)
+    {
+        wxFile file;
+        if (!file.Create(path, true)) return false;
+
+        wxString text = "CIRCUIT\t1\n";
+        // 1. 写入所有元件
+        for (const auto& c : m_components) {
+            text << c->Serialize() << "\n";
+        }
+
+        // 2. 写入所有连线 (生成组件索引映射表)
+        std::map<Component*, int> compIndex;
+        for (size_t i = 0; i < m_components.size(); ++i) {
+            compIndex[m_components[i].get()] = (int)i;
+        }
+        for (const auto& w : m_wires) {
+            int fromIdx = w.startComp ? compIndex[w.startComp] : -1;
+            int toIdx = w.endComp ? compIndex[w.endComp] : -1;
+            // 格式：WIRE 起点组件号 起点引脚 终点组件号 终点引脚 终点X坐标 终点Y坐标
+            text << wxString::Format("WIRE\t%d\t%d\t%d\t%d\t%d\t%d\n",
+                fromIdx, w.startPin, toIdx, w.endPin, w.end.x, w.end.y);
+        }
+
+        const wxScopedCharBuffer buf = text.utf8_str();
+        return file.Write(buf.data(), buf.length()) == buf.length();
+    }
+
+    // ---- 新增功能 3：从文件加载 (Open) ----
+    bool LoadFromFile(const wxString& path)
+    {
+        wxFile file(path, wxFile::read);
+        if (!file.IsOpened()) {
+            wxMessageBox("无法打开文件，可能被占用或不存在。", "错误");
+            return false;
+        }
+
+        wxString text;
+        file.ReadAll(&text);
+
+        if (text.IsEmpty()) {
+            wxMessageBox("文件内容为空！", "错误");
+            return false;
+        }
+
+        std::vector<std::unique_ptr<Component>> tempComps;
+        std::vector<std::tuple<int, int, int, int, wxPoint>> tempWires;
+
+        wxStringTokenizer lines(text, "\n");
+        bool headerOk = false;
+        while (lines.HasMoreTokens()) {
+            wxString line = lines.GetNextToken().Trim();
+            if (line.IsEmpty()) continue;
+
+            if (line.StartsWith("CIRCUIT")) { headerOk = true; continue; }
+
+            wxStringTokenizer f(line, "\t");
+            wxArrayString fields;
+            while (f.HasMoreTokens()) fields.Add(f.GetNextToken());
+
+            if (fields.IsEmpty()) continue;
+
+            if (fields[0] != "WIRE") {
+                Component* c = CreateComponent(fields[0], wxPoint(0, 0));
+                if (c && c->Deserialize(fields)) {
+                    tempComps.push_back(std::unique_ptr<Component>(c));
+                }
+                else {
+                    wxMessageBox("无法识别元件: " + fields[1], "解析错误");
+                }
+            }
+            else if (fields[0] == "WIRE") {
+                int fromIdx = wxAtoi(fields[1]);
+                int fromPin = wxAtoi(fields[2]);
+                int toIdx = wxAtoi(fields[3]);
+                int toPin = wxAtoi(fields[4]);
+                wxPoint end(wxAtoi(fields[5]), wxAtoi(fields[6]));
+                tempWires.push_back({ fromIdx, fromPin, toIdx, toPin, end });
+            }
+        }
+
+        if (tempComps.empty()) {
+            wxMessageBox("文件解析完成，但没有发现任何元件。", "提示");
+        }
+
+        m_components = std::move(tempComps);
+        m_wires.clear();
+        for (const auto& tw : tempWires) {
+            Wire w;
+            w.startComp = (std::get<0>(tw) >= 0 && std::get<0>(tw) < (int)m_components.size()) ? m_components[std::get<0>(tw)].get() : nullptr;
+            w.startPin = std::get<1>(tw);
+            w.endComp = (std::get<2>(tw) >= 0 && std::get<2>(tw) < (int)m_components.size()) ? m_components[std::get<2>(tw)].get() : nullptr;
+            w.endPin = std::get<3>(tw);
+            w.end = std::get<4>(tw);
+            m_wires.push_back(w);
+        }
+
+        Simulate();
+        Refresh();
+        return true;
+    }
     void AddComponent(const wxString& type)
     {
         wxSize sz = GetClientSize();
@@ -1594,6 +1720,8 @@ private:
             w.startPin = m_wireSrcPin;
             w.startFree = m_wireStartFree;
             w.end = m_wireEnd;
+            w.endComp = target;
+            w.endPin = targetPin;
             m_wires.push_back(w);
 
             m_drawingWire = false;
@@ -1808,6 +1936,10 @@ public:
     MainFrame(const wxString& title);
 
 private:
+    wxString m_currentFilePath;
+    void OnNew(wxCommandEvent& event);
+    void OnOpen(wxCommandEvent& event);
+    void OnSave(wxCommandEvent& event);
     wxMenuBar* m_menuBar;
     wxToolBar* m_toolBar;
     wxSplitterWindow* m_splitterOuter;
@@ -1850,6 +1982,9 @@ MainFrame::MainFrame(const wxString& title)
     BuildToolBar();
     BuildSplitterLayout();
     BuildStatusBar();
+    Bind(wxEVT_MENU, &MainFrame::OnNew, this, wxID_NEW);
+    Bind(wxEVT_MENU, &MainFrame::OnOpen, this, wxID_OPEN);
+    Bind(wxEVT_MENU, &MainFrame::OnSave, this, wxID_SAVE);
 }
 
 void MainFrame::BuildMenuBar()
@@ -2134,4 +2269,43 @@ bool CircuitEditorApp::OnInit()
     MainFrame* frame = new MainFrame(wxT("Circuit Editor: main of Untitled"));
     frame->Show(true);
     return true;
+}
+
+void MainFrame::OnNew(wxCommandEvent& event)
+{
+    m_canvas->ClearAll();
+    m_currentFilePath.Clear();
+    SetTitle("Circuit Editor - Untitled");
+}
+
+void MainFrame::OnOpen(wxCommandEvent& event)
+{
+    wxFileDialog dlg(this, "打开电路", "", "",
+        "Circuit Files (*.circ)|*.circ|All Files (*.*)|*.*", wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dlg.ShowModal() == wxID_OK) {
+        if (m_canvas->LoadFromFile(dlg.GetPath())) {
+            m_currentFilePath = dlg.GetPath();
+            SetTitle("Circuit Editor - " + dlg.GetFilename());
+        }
+        else {
+            wxMessageBox("文件格式错误，无法打开。", "错误");
+        }
+    }
+}
+
+void MainFrame::OnSave(wxCommandEvent& event)
+{
+    if (m_currentFilePath.IsEmpty()) {
+        wxFileDialog dlg(this, "保存电路", "", "my_circuit.circ",
+            "Circuit Files (*.circ)|*.circ", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (dlg.ShowModal() != wxID_OK) return;
+        m_currentFilePath = dlg.GetPath();
+    }
+
+    if (m_canvas->SaveToFile(m_currentFilePath)) {
+        SetTitle("Circuit Editor - " + wxFileName(m_currentFilePath).GetFullName());
+    }
+    else {
+        wxMessageBox("保存失败，请检查路径权限。", "错误");
+    }
 }
